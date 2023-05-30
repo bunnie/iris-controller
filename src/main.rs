@@ -22,6 +22,9 @@ use bsp::hal::{
     watchdog::Watchdog,
 };
 
+use xous_pio;
+use xous_pio::pio_tests::*;
+
 #[entry]
 fn main() -> ! {
     info!("Program start");
@@ -60,6 +63,44 @@ fn main() -> ! {
     // LED to one of the GPIO pins, and reference that pin here.
     let mut led_pin = pins.led.into_push_pull_output();
 
+    unsafe {
+        info!("ID readback: 0x{:x}", (0x5020_0044 as *mut u32).read_volatile());
+    }
+
+    // Reset the PIO block. This is necessary for the PIO block to work.
+    pac.RESETS.reset.modify(|_, w| w.pio0().set_bit());
+    pac.RESETS.reset.modify(|_, w| w.pio0().clear_bit());
+    while pac.RESETS.reset_done.read().pio0().bit_is_clear() {}
+
+    info!("ID: 0x{:x}", xous_pio::get_id());
+
+    info!("FIFO test");
+    units::fifo_join_test();
+    info!("adder test");
+    adder::adder_test();
+    info!("restart immediate test");
+    units::restart_imm_test();
+
+    info!("setting up GPIOs for feedback");
+    const GPIO_BASE: usize = 0x4001_4000;
+    for i in 2..30 { // 0 & 1 are for serial output, 30 and 31 don't exist
+        if i != 25 { // 25 is for the LED
+            unsafe{((GPIO_BASE + 4 + i * 8) as *mut u32).write_volatile(6);}
+        }
+    }
+
+    info!("doing corner cases");
+    units::corner_cases();
+    info!("doing instruction tests");
+    units::instruction_tests();
+
+    // note: an external pulldown on GPIO28 makes this test much more reliable
+    info!("doing register tests");
+    units::register_tests();
+
+    info!("doing sticky tests");
+    units::sticky_test();
+
     loop {
         info!("on!");
         led_pin.set_high().unwrap();
@@ -70,4 +111,3 @@ fn main() -> ! {
     }
 }
 
-// End of file
