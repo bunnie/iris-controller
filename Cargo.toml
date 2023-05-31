@@ -15,17 +15,23 @@ panic-probe = { version = "0.3", features = ["print-defmt"] }
 # We're using a Pico by default on this template
 rp-pico = "0.7"
 
-# validate the Xous PIO crate
-xous-pio = {path = "../xous-cramium/libs/xous-pio", default-features=false, features=["tests", "rp2040"]}
+servo-pio = "0.1.0"
+critical-section = "1.1.0"
+fugit = "0.3.6"
+arrayvec = { version = "0.7.2", default-features = false }
+nb = "1.0.0"
+
 pio-proc = "0.2.2"
 pio = "0.2.1"
 
-# but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
-# sparkfun-pro-micro-rp2040 = "0.6"
-
+pimoroni-servo2040 = "0.3.0"
 # If you're not going to use a Board Support Package you'll need these:
 rp2040-hal = { version="0.8", features=["rt", "critical-section-impl"] }
-rp2040-boot2 = "0.2"
+# rp2040-boot2 = "0.2"
+
+[features]
+debug_pio = []
+defmt = ["rp2040-hal/defmt"]
 
 # cargo build/run
 [profile.dev]
