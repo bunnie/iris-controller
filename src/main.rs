@@ -38,6 +38,13 @@ static mut GLOBALS: GlobalStates<NUM_CHANNELS> = {
     }
 };
 
+#[derive(Debug, Format)]
+enum OpMode {
+    Angle,
+    Brightness,
+    Pixel,
+}
+
 #[pimoroni_servo2040::entry]
 fn main() -> ! {
     info!("entering main");
@@ -142,8 +149,10 @@ fn main() -> ! {
     const MIN_PULSE: f32 = 1500.0;
     const MID_PULSE: f32 = 2000.0;
     const MAX_PULSE: f32 = 2500.0;
-    const QE_MIN: i32 = -100;
-    const QE_MAX: i32 = 100;
+    const ANGLE_MIN: i32 = -100;
+    const ANGLE_MAX: i32 = 100;
+    const ANGLE_INCREMENT: i32 = 1;
+    const BRIGHTNESS_INCREMENT: u16 = MAX_PWM / 128;
 
     let movement_delay = 20.millis();
 
@@ -155,11 +164,16 @@ fn main() -> ! {
     info!("set_pulse");
     count_down.start(movement_delay * 5);
 
-    let mut brightness = 0;
-    let mut going_up = true;
-    const STEP_SIZE: u16 = 128;
-    let mut qe_val = 0;
+    let mut brightness = MAX_PWM;
     let mut switch_pressed = false;
+    let mut mode = OpMode::Angle;
+    let mut last_delta = 0;
+    let mut angle = 0;
+
+    channel.set_duty(brightness);
+    servo_cluster.set_pulse(servo1, MID_PULSE, false);
+    servo_cluster.load();
+
     info!("entering loop");
     #[allow(clippy::empty_loop)]
     loop {
@@ -167,26 +181,18 @@ fn main() -> ! {
         qe_tx.write(1);
 
         // handle PWM
-        channel.set_duty(brightness);
-        if going_up {
-            if brightness < MAX_PWM {
-                brightness = brightness.saturating_add(STEP_SIZE);
-            } else {
-                going_up = false;
-            }
-        } else {
-            if brightness > 0 {
-                brightness = brightness.saturating_sub(STEP_SIZE);
-            } else {
-                going_up = true;
-            }
-        }
         count_down.start(movement_delay);
         let _ = nb::block!(count_down.wait());
 
         if !switch_pressed && switch.is_low().unwrap_or(false) {
             switch_pressed = true;
-            info!("press!");
+            // cycle through the modes
+            mode = match mode {
+                OpMode::Angle => OpMode::Brightness,
+                OpMode::Brightness => OpMode::Pixel,
+                OpMode::Pixel => OpMode::Angle,
+            };
+            info!("switching to {:?}", mode);
         } else if switch.is_high().unwrap_or(false) {
             switch_pressed = false;
         }
@@ -196,15 +202,45 @@ fn main() -> ! {
         }
         match qe_rx.read() {
             Some(val) => {
-                qe_val = i32::from_le_bytes(val.to_le_bytes());
+                let qe_val = i32::from_le_bytes(val.to_le_bytes());
+                // this breaks when the encoder wraps around at...2 billion counts or something.
+                if qe_val != last_delta {
+                    let going_up = qe_val > last_delta;
+                    last_delta = qe_val;
+                    match mode {
+                        OpMode::Angle => {
+                            // handle servo
+                            if !going_up {
+                                angle += ANGLE_INCREMENT;
+                                angle = angle.min(ANGLE_MAX);
+                            } else {
+                                angle -= ANGLE_INCREMENT;
+                                angle = angle.max(ANGLE_MIN);
+                            }
+                            let mut pulse: f32 = (angle as f32) * (MAX_PULSE - MIN_PULSE) / (ANGLE_MAX as f32 - ANGLE_MIN as f32) + MID_PULSE;
+                            pulse = pulse.clamp(MIN_PULSE, MAX_PULSE);
+                            servo_cluster.set_pulse(servo1, pulse, false);
+                            servo_cluster.load();
+
+                        }
+                        OpMode::Brightness => {
+                            if going_up {
+                                brightness += BRIGHTNESS_INCREMENT;
+                                brightness = brightness.min(MAX_PWM);
+                            } else {
+                                brightness = brightness.saturating_sub(BRIGHTNESS_INCREMENT);
+                            }
+                            info!("new brightness: {}", brightness);
+                            channel.set_duty(brightness);
+                        }
+                        OpMode::Pixel => {
+
+                        }
+                    }
+                }
             },
             _ => info!("QE error"),
         }
-        // handle servo
-        let mut pulse: f32 = (qe_val as f32) * (MAX_PULSE - MIN_PULSE) / (QE_MAX as f32 - QE_MIN as f32) + MID_PULSE;
-        pulse = pulse.clamp(MIN_PULSE, MAX_PULSE);
-        servo_cluster.set_pulse(servo1, pulse, false);
-        servo_cluster.load();
     }
 }
 
