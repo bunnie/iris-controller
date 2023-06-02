@@ -10,6 +10,7 @@ use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::PwmPin;
 use embedded_hal::digital::v2::InputPin;
+use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::timer::CountDown;
 use fugit::ExtU64;
 use panic_probe as _;
@@ -17,7 +18,7 @@ use pimoroni_servo2040::hal::clocks::SystemClock;
 use pimoroni_servo2040::hal::dma::{Channel, ChannelIndex, DMAExt, CH0, CH1};
 use pimoroni_servo2040::hal::gpio::{Error as GpioError, FunctionConfig, FunctionPio0};
 use pimoroni_servo2040::hal::pio::{PIOExt, StateMachineIndex, UninitStateMachine, PIO, SM0};
-use pimoroni_servo2040::hal::{self, pac, Clock};
+use pimoroni_servo2040::hal::{self, pac};
 use pimoroni_servo2040::pac::{interrupt, PIO0};
 use servo_pio::calibration::{AngularCalibration, Calibration};
 use servo_pio::pwm_cluster::{dma_interrupt, GlobalState, GlobalStates, Handler};
@@ -117,7 +118,7 @@ fn main() -> ! {
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
 
     // Configure PWM4
-    let pwm = &mut pwm_slices.pwm4;
+    let pwm = &mut pwm_slices.pwm3;
     pwm.set_ph_correct();
     pwm.set_div_int(1);
     const MAX_PWM: u16 = 4096; // 15kHz PWM (must be in the range of 5-100kHz)
@@ -125,8 +126,8 @@ fn main() -> ! {
     pwm.enable();
 
     // Output channel B on PWM4 to the LED pin
-    let channel = &mut pwm.channel_b;
-    channel.output_to(pins.adc_addr_2);
+    let channel = &mut pwm.channel_a;
+    let mut pwm_pin = Some(channel.output_to(pins.adc_addr_0));
     info!("pwm");
 
     // Init encoder ---------------------------------------
@@ -139,6 +140,11 @@ fn main() -> ! {
 
     // Init switch ---------------------------------------
     let switch = pins.servo13.into_pull_up_input();
+
+    // Lateral light angle -------------------------------
+    let mut clk = pins.scl.into_push_pull_output_in_state(hal::gpio::PinState::Low);
+    // let mut data = pins.adc_addr_0.into_push_pull_output_in_state(hal::gpio::PinState::Low);
+    let mut data_pin: Option<rp2040_hal::gpio::Pin<_, _>> = None;
 
     // Unmask the DMA interrupt so the handler can start running. This can only
     // be done after the servo cluster has been built.
@@ -155,6 +161,7 @@ fn main() -> ! {
     const BRIGHTNESS_INCREMENT: u16 = MAX_PWM / 128;
 
     let movement_delay = 20.millis();
+    let shift_delay = 100.micros();
 
     // We need to use the indices provided by the cluster because the servo pin
     // numbers do not line up with the indices in the clusters and PIO.
@@ -169,6 +176,11 @@ fn main() -> ! {
     let mut mode = OpMode::Angle;
     let mut last_delta = 0;
     let mut angle = 0;
+    let mut pixel_state = 1u16;
+    let mut pix_ud_count = 0i32;
+    const RELAXATION_INTERVAL: usize = 30;
+    const UD_THRESHOLD: usize = 3;
+    let mut r_interval = 0;
 
     channel.set_duty(brightness);
     servo_cluster.set_pulse(servo1, MID_PULSE, false);
@@ -189,8 +201,32 @@ fn main() -> ! {
             // cycle through the modes
             mode = match mode {
                 OpMode::Angle => OpMode::Brightness,
-                OpMode::Brightness => OpMode::Pixel,
-                OpMode::Pixel => OpMode::Angle,
+                OpMode::Brightness => {
+                    let convert_to_pin = pwm_pin.take().unwrap();
+                    data_pin = Some(convert_to_pin.into_push_pull_output());
+                    OpMode::Pixel
+                },
+                OpMode::Pixel => {
+                    if let Some(data) = data_pin.as_mut() {
+                        data.set_low().unwrap();
+                        count_down.start(shift_delay);
+                        let _ = nb::block!(count_down.wait());
+                        // all on again
+                        clk.set_low().unwrap();
+                        for _ in 0..5 {
+                            data.set_low().unwrap();
+                            count_down.start(shift_delay);
+                            let _ = nb::block!(count_down.wait());
+                            clk.set_high().unwrap();
+                            count_down.start(shift_delay);
+                            let _ = nb::block!(count_down.wait());
+                            clk.set_low().unwrap();
+                        }
+                    }
+                    let convert_to_pin = data_pin.take().unwrap();
+                    pwm_pin = Some(channel.output_to(convert_to_pin));
+                    OpMode::Angle
+                },
             };
             info!("switching to {:?}", mode);
         } else if switch.is_high().unwrap_or(false) {
@@ -234,12 +270,90 @@ fn main() -> ! {
                             channel.set_duty(brightness);
                         }
                         OpMode::Pixel => {
-
+                            /*
+                            if going_up {
+                                info!("setting lows");
+                                clk.set_low().unwrap();
+                                for _i in 0..5 {
+                                    data.set_low().unwrap();
+                                    count_down.start(shift_delay);
+                                    let _ = nb::block!(count_down.wait());
+                                    clk.set_high().unwrap();
+                                    count_down.start(shift_delay);
+                                    let _ = nb::block!(count_down.wait());
+                                    clk.set_low().unwrap();
+                                }
+                            } else {
+                                info!("setting highs");
+                                clk.set_low().unwrap();
+                                for _i in 0..5 {
+                                    data.set_high().unwrap();
+                                    count_down.start(shift_delay);
+                                    let _ = nb::block!(count_down.wait());
+                                    clk.set_high().unwrap();
+                                    count_down.start(shift_delay);
+                                    let _ = nb::block!(count_down.wait());
+                                    clk.set_low().unwrap();
+                                }
+                            } */
+                            if going_up {
+                                pix_ud_count += 1;
+                            } else {
+                                pix_ud_count -= 1;
+                            }
+                            if pix_ud_count.abs() > UD_THRESHOLD as i32 {
+                                if pix_ud_count > 0 {
+                                    pixel_state <<= 1;
+                                    pixel_state = pixel_state.min(0b1_0000);
+                                } else {
+                                    pixel_state >>= 1;
+                                    pixel_state = pixel_state.max(0b0_0001);
+                                }
+                                // catch if the bit "fell off the edge"
+                                let checked_state = if pixel_state == 0 {
+                                    0b0_0001
+                                } else if pixel_state > 0b1_0000 {
+                                    0b1_0000
+                                } else {
+                                    pixel_state
+                                };
+                                info!("pixel state: {:b}", checked_state);
+                                if let Some(data) = data_pin.as_mut() {
+                                    clk.set_low().unwrap();
+                                    for i in 0..5 {
+                                        if (checked_state >> i) & 1 != 0 {
+                                            // low means pixel is on
+                                            data.set_low().unwrap();
+                                        } else {
+                                            data.set_high().unwrap();
+                                        }
+                                        count_down.start(shift_delay);
+                                        let _ = nb::block!(count_down.wait());
+                                        clk.set_high().unwrap();
+                                        count_down.start(shift_delay);
+                                        let _ = nb::block!(count_down.wait());
+                                        clk.set_low().unwrap();
+                                    }
+                                    // otherwise the PWM is off
+                                    data.set_high().unwrap();
+                                }
+                                pix_ud_count = 0;
+                            }
                         }
                     }
                 }
             },
             _ => info!("QE error"),
+        }
+        r_interval += 1;
+        if r_interval > RELAXATION_INTERVAL {
+            // info!("r_interval: {}", r_interval);
+            if pix_ud_count > 0 {
+                pix_ud_count -= 1;
+            } else if pix_ud_count < 0 {
+                pix_ud_count += 1;
+            }
+            r_interval = 0;
         }
     }
 }
